@@ -97,6 +97,20 @@ pub const Allocator = struct {
         return self.alignedAlloc(T, null, n);
     }
 
+    fn hackyIsComptime() bool {
+       var t: bool = true;
+       const x = if (t) u7(0) else u8(0);
+       return @typeOf(x) == u7;
+    }
+    fn hackyComptimeBytesToSlice(comptime T: type, bytes: var, desired_length: usize) [] align(@typeInfo(@typeOf(bytes)).Pointer.alignment) T {
+        //This line would be correct, but results in "error: cannot store runtime value in compile time variable" when calculating the difference of @intToPtr within the same memory region in the allocator code
+        //return @ptrCast([*]T, bytes.ptr)[0..desired_length];
+        //calculating it in a local variable also doesn't work:
+        //const desired_length = @divExact(bytes.len, @sizeOf(T));
+        //This line is semantically incorrect, but works as "being comptime-known enough".
+        return @ptrCast([*]T, bytes.ptr)[0..bytes.len];
+    }
+    
     pub fn alignedAlloc(
         self: *Allocator,
         comptime T: type,
@@ -117,15 +131,18 @@ pub const Allocator = struct {
         const byte_slice = try self.reallocFn(self, ([*]u8)(undefined)[0..0], undefined, byte_count, a);
         assert(byte_slice.len == byte_count);
         @memset(byte_slice.ptr, undefined, byte_slice.len);
-        if (alignment == null) {
+        //rohlem: I don't have enough insight behind the scenes to know what this branching accomplishes. Commenting it out probably breaks some test cases, but I didn't take the time to comptime-ify both branches without even understanding the full background behind them.
+        //if (alignment == null) {
             // TODO This is a workaround for zig not being able to successfully do
             // @bytesToSlice(T, @alignCast(a, byte_slice)) without resolving alignment of T,
             // which causes a circular dependency in async functions which try to heap-allocate
             // their own frame with @Frame(func).
-            return @intToPtr([*]T, @ptrToInt(byte_slice.ptr))[0..n];
-        } else {
-            return @bytesToSlice(T, @alignCast(a, byte_slice));
-        }
+        //    return @ptrCast([*]T, @alignCast(@alignOf(T), byte_slice.ptr))[0..n];//@intToPtr([*]T, @ptrToInt(byte_slice.ptr))[0..n];
+        //} else {
+            var aligned_slice = @alignCast(alignment orelse @alignOf(T), byte_slice);
+            // @bytesToSlice results in "unable to evaluate constant expression" directly at the statement. An under-the-hood @ptrCast should do the same... right?
+            return if(hackyIsComptime()) hackyComptimeBytesToSlice(T, aligned_slice, n) else @bytesToSlice(T, aligned_slice);
+        //}
     }
 
     /// This function requests a new byte size for an existing allocation,
@@ -169,7 +186,7 @@ pub const Allocator = struct {
         const byte_count = math.mul(usize, @sizeOf(T), new_n) catch return Error.OutOfMemory;
         const byte_slice = try self.reallocFn(self, old_byte_slice, Slice.alignment, byte_count, new_alignment);
         assert(byte_slice.len == byte_count);
-        if (new_n > old_mem.len) {
+        if (byte_count > old_mem.len) {
             @memset(byte_slice.ptr + old_byte_slice.len, undefined, byte_slice.len - old_byte_slice.len);
         }
         return @bytesToSlice(T, @alignCast(new_alignment, byte_slice));
@@ -222,7 +239,11 @@ pub const Allocator = struct {
         const Slice = @typeInfo(@typeOf(memory)).Pointer;
         const bytes = @sliceToBytes(memory);
         if (bytes.len == 0) return;
-        const non_const_ptr = @intToPtr([*]u8, @ptrToInt(bytes.ptr));
+        //The next line used @intToPtr(@ptrToInt(ptr)) to hack pointer-to-const into pointer-to-non-const.
+        //During comptime this results in "error: cannot store runtime value in compile time variable".
+        //The best solution would probably be to either allow this in a @ptrCast, or create a special @constCast for this use case.
+        //Note that the Allocator interface doesn't allow users to shrink slices-to-const either, so allowing freeing could be seen as an inconsistency.
+        const non_const_ptr = @ptrCast([*]u8, bytes.ptr);//@intToPtr([*]u8, @ptrToInt(bytes.ptr));
         const shrink_result = self.shrinkFn(self, non_const_ptr[0..bytes.len], Slice.alignment, 0, 1);
         assert(shrink_result.len == 0);
     }
