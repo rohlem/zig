@@ -534,3 +534,31 @@ const Item = struct {
 //   try S.doTheTest();
 //   comptime try S.doTheTest();
 //}
+
+test "'optimal size' two-phase comptime allocation scheme" {
+   const S = struct {
+      fn operationThatAllocatesData(data: [] u8) []u8 { //our black-box view of the operation; returns a slice of the input data
+         // use the provided buffer as allocator backing
+         var allocator_object = TypedFixedBufferAllocator(u8).init(data);
+         var allocator = &allocator_object.allocator;
+         
+         //create function-scope buffers if intermediary data is necessary for computation
+         var more_memory: [1024]u8 = undefined;
+         
+         const final_size = 16; //computation...
+         
+         return data[0..final_size]; //return the sized result
+      }
+      var foo = comptime blk: { //at this point, we (programmer) don't know what type foo will end up being.
+         //first, allocate more space than we will probably need
+          var bytes: [1024] u8 align(@alignOf(i32)) = undefined;
+          const size = operationThatAllocatesData(bytes[0..bytes.len]).len; // run operation once to see how much space we need
+          
+          var result: [size]u8 = undefined; //now we know the size, choose a size that fits our needs
+          testing.expectEqual(result[0..result.len], operationThatAllocatesData(result[0..size])); //now we run the operation again, memory is result-location-in-place
+          break :blk result;
+      }; //foo is exactly the right size.
+   };
+   testing.expectEqual(16, S.foo.len);
+   comptime testing.expectEqual(16, S.foo.len);
+}
